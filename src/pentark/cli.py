@@ -29,6 +29,7 @@ from pentark.core.errors import PentarkError
 from pentark.core.ratelimit import RateLimiter
 from pentark.core.scope import load_scope
 from pentark.preflight import check_tools
+from pentark.scaffold import build_scope_yaml, normalize_targets, run_init
 
 app = typer.Typer(add_completion=False, help="PentARK — authorized-use web app pentest framework.")
 console = Console()
@@ -47,6 +48,46 @@ _SEV_STYLE = {
 def version() -> None:
     """Print the version."""
     console.print(f"pentark {__version__}")
+
+
+@app.command()
+def init(config: str = typer.Option("scope.yaml", "--config", "-c", help="where to write scope.yaml")) -> None:
+    """Interactively create scope.yaml — just type your authorized targets."""
+    def _ask(prompt: str, default: str) -> str:
+        return typer.prompt(prompt, default=default, show_default=bool(default))
+
+    def _confirm(prompt: str) -> bool:
+        return typer.confirm(prompt, default=False)
+
+    run_init(_ask, _confirm, console.print, path=config)
+
+
+@app.command("add-target")
+def add_target(
+    target: str = typer.Argument(..., help="host/IP or URL to authorize"),
+    config: str = typer.Option("scope.yaml", "--config", "-c", help="path to scope.yaml"),
+) -> None:
+    """Add one authorized target to an existing scope.yaml (no editing)."""
+    sc = load_scope(config)  # must already exist (run `init` first)
+    add_hosts, add_prefixes = normalize_targets([target])
+    hosts = list(dict.fromkeys(list(sc.hosts) + add_hosts))
+    prefixes = list(dict.fromkeys(list(sc.url_prefixes) + add_prefixes))
+    text = build_scope_yaml(
+        operator=sc.authorization.operator,
+        acknowledgement=sc.authorization.acknowledgement,
+        signed=sc.authorization.signed,
+        expires=sc.authorization.expires.isoformat() if sc.authorization.expires else None,
+        hosts=hosts,
+        url_prefixes=prefixes,
+        rate_limit_rps=sc.settings.rate_limit_rps,
+        timeout_seconds=sc.settings.timeout_seconds,
+        user_agent=sc.settings.user_agent,
+        audit_path=sc.settings.audit_path,
+        authorized=sc.authorization.authorized,
+    )
+    Path(config).write_text(text, encoding="utf-8")
+    console.print(f"[green]Added[/green] to scope: {target}")
+    console.print(f"In scope now: {hosts + prefixes}")
 
 
 @app.command()

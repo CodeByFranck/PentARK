@@ -63,9 +63,12 @@ python -m pip install -e ".[dev]"     # Python 3.11+
 ## Usage
 
 ```bash
-# 1. Create your authorization/scope file and edit it.
-cp scope.example.yaml scope.yaml
-#    set authorized: true, operator, signed, and the hosts/url_prefixes you may test
+# 1. Create your authorization/scope file by just typing your targets — no YAML editing.
+pentark init
+#    answer a few prompts (operator, targets you're authorized to test, attestation)
+
+#    ...or add a target to an existing scope in one command:
+pentark add-target http://192.168.56.101/
 
 # 2. Confirm the gate and see what's in scope.
 pentark scope
