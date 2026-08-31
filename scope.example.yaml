@@ -1,0 +1,37 @@
+# PentARK engagement scope & authorization.
+# -----------------------------------------------------------------------------
+# Copy this to `scope.yaml` and edit it. NOTHING active runs until this file
+# exists, `authorized: true` is set, and the acknowledgement/signature are filled
+# in. Every request's target is checked against the allowlist below; anything
+# off-scope is refused and logged.
+
+authorization:
+  # Explicit attestation. Set true ONLY if you hold written authorization to test
+  # every target listed under `scope`.
+  authorized: true
+  operator: "Your Name <you@example.com>"
+  # The written statement you are attesting to.
+  acknowledgement: >-
+    I have explicit written authorization to perform security testing against
+    the targets listed in this file, and I will stay within that authorization.
+  # Your signature/reference (name + date, SOW id, ticket, etc.) — make it traceable.
+  signed: "Your Name, 2026-08-31"
+  # Optional expiry (YYYY-MM-DD). Runs are refused after this date.
+  expires: "2026-12-31"
+
+scope:
+  # Authorized targets. A request is in scope if its host matches `hosts`
+  # (exact, case-insensitive) or its URL starts with one of `url_prefixes`.
+  # Default-deny: an empty scope means nothing is authorized.
+  hosts:
+    - "127.0.0.1"
+    - "localhost"
+  url_prefixes:
+    - "http://localhost:3000/"    # e.g. OWASP Juice Shop
+    - "http://127.0.0.1/dvwa/"    # e.g. DVWA
+
+settings:
+  rate_limit_rps: 5               # max requests/second (throttle; 0 = unlimited)
+  timeout_seconds: 15
+  user_agent: "PentARK/0.1 (authorized security testing)"
+  audit_path: "pentark-audit.jsonl"

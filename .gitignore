@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Local config & engagement artifacts — NEVER commit these.
+# They can contain target details, credentials, evidence, and audit trails.
+scope.yaml
+*.audit.jsonl
+pentark-audit*.jsonl
+findings*.json
+loot/
+reports/
+output/
+evidence/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
