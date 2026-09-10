@@ -30,12 +30,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# PDF reporting pulls in reportlab (pure-Python, no system libraries), so it is
+# an opt-in extra — the Markdown report needs nothing beyond the standard library.
+report = ["reportlab>=4.0"]
 # Metasploit integration is only needed for the (later, user-driven) exploitation
 # phase, so it stays out of the core install.
 exploit = ["pymetasploit3>=1.0"]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
+    "reportlab>=4.0",  # so the PDF report path is covered by the test suite
 ]
 
 [project.scripts]

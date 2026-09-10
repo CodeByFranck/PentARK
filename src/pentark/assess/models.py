@@ -71,6 +71,25 @@ class Finding:
             "remediation": self.remediation,
         }
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Finding":
+        """Rebuild a Finding from its stored dict (severity/score are re-derived
+        from the CVSS vector, never trusted from the file)."""
+        try:
+            return cls(
+                check_id=str(data["check_id"]),
+                name=str(data["name"]),
+                endpoint=str(data["endpoint"]),
+                cvss_vector=str(data["cvss_vector"]),
+                description=str(data.get("description", "")),
+                remediation=str(data.get("remediation", "")),
+                evidence=str(data.get("evidence", "")),
+                confidence=str(data.get("confidence", "medium")),
+                cwe=data.get("cwe"),
+            )
+        except KeyError as exc:
+            raise ValueError(f"finding is missing required field: {exc.args[0]!r}") from exc
+
 
 @dataclass
 class AssessmentResult:
@@ -93,6 +112,20 @@ class AssessmentResult:
             "summary": self.summary(),
             "findings": [f.to_dict() for f in self.findings],
         }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "AssessmentResult":
+        """Rebuild an AssessmentResult from a previously saved findings JSON."""
+        if not isinstance(data, dict):
+            raise ValueError("findings JSON root must be an object")
+        raw_findings = data.get("findings", [])
+        if not isinstance(raw_findings, list):
+            raise ValueError("'findings' must be a list")
+        return cls(
+            target=str(data.get("target", "")),
+            findings=[Finding.from_dict(f) for f in raw_findings],
+            meta=dict(data.get("meta", {})),
+        )
 
 
 __all__ = ["Finding", "AssessmentResult"]
