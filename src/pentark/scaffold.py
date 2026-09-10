@@ -78,6 +78,19 @@ def build_scope_yaml(
         f"  timeout_seconds: {timeout_seconds}\n"
         f'  user_agent: "{user_agent}"\n'
         f'  audit_path: "{audit_path}"\n'
+        "\n"
+        "# Authenticated sessions for A01 (Broken Access Control) testing. Higher\n"
+        "# 'privilege' = more access; the no-session identity is tested automatically.\n"
+        "# Uncomment and fill in with sessions you are authorized to use:\n"
+        "# identities:\n"
+        "#   - name: low\n"
+        "#     role: user\n"
+        "#     privilege: 1\n"
+        "#     cookies: { session: \"<low-priv session cookie>\" }\n"
+        "#   - name: high\n"
+        "#     role: admin\n"
+        "#     privilege: 10\n"
+        "#     headers: { Authorization: \"Bearer <high-priv token>\" }\n"
     )
 
 

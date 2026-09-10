@@ -23,7 +23,15 @@ from rich.console import Console
 from rich.table import Table
 
 from pentark import __version__
+from pentark.assess.access import AccessControlAuditor, load_requests
+from pentark.assess.checks import ALL_CHECKS, DefaultCredentialsCheck
+from pentark.assess.checks.base import CheckContext
 from pentark.assess.http_client import HttpClient
+from pentark.assess.injection import InjectionScanner
+from pentark.assess.injection.confirmers import PlaywrightConfirmer, SqlmapConfirmer
+from pentark.assess.logic import LogicScanner, load_spec
+from pentark.assess.supplychain import OsvClient, SupplyChainCheck
+from pentark.assess.supplychain.check import build_findings
 from pentark.assess.models import AssessmentResult
 from pentark.assess.runner import AssessmentRunner
 from pentark.core.audit import AuditLog
@@ -131,6 +139,12 @@ def assess(
     report_format: str = typer.Option(
         "md", "--report-format", help="report format when --report is used: md | pdf | both"
     ),
+    default_creds: bool = typer.Option(
+        False,
+        "--default-creds",
+        help="also test a small built-in default-credential list against a discovered login "
+        "form. ACTIVE (submits logins) and OFF by default — may lock accounts.",
+    ),
 ) -> None:
     """Run the assessment phase against an in-scope target."""
     sc = load_scope(config)
@@ -141,13 +155,21 @@ def assess(
     audit = AuditLog(sc.settings.audit_path)
     audit.log("run.start", target=target, operator=sc.authorization.operator, phase="assess")
 
+    checks = list(ALL_CHECKS)
+    if default_creds:
+        console.print(
+            "[yellow]--default-creds is ON[/yellow] — submitting login attempts to any "
+            "discovered form (may lock accounts)."
+        )
+        checks.append(DefaultCredentialsCheck())
+
     http = HttpClient(
         sc,
         rate_limiter=RateLimiter(sc.settings.rate_limit_rps),
         audit=audit,
     )
     try:
-        result = AssessmentRunner(http, audit=audit).run(target)
+        result = AssessmentRunner(http, checks=checks, audit=audit).run(target)
     finally:
         http.close()
 
@@ -170,6 +192,306 @@ def assess(
         for fmt_name, path in _report_paths(report, report_format):
             _write_report(result, meta, fmt_name, path)
     console.print(f"Audit log: [bold]{sc.settings.audit_path}[/bold]")
+
+
+@app.command()
+def access(
+    requests_file: str = typer.Option(
+        None, "--requests", "-r", help="YAML/JSON file of recorded requests to replay"
+    ),
+    forced_browsing: str = typer.Option(
+        None, "--forced-browsing", "-b", help="base URL to probe for admin paths (forced browsing)"
+    ),
+    config: str = typer.Option("scope.yaml", "--config", "-c", help="path to scope.yaml"),
+    output: str = typer.Option(None, "--output", "-o", help="write prioritized findings JSON here"),
+    allow_mutation: bool = typer.Option(
+        False,
+        "--allow-mutation",
+        help="permit state-changing requests (replay non-GET flows, active PUT/DELETE method "
+        "tampering). OFF by default - may modify data.",
+    ),
+) -> None:
+    """A01 - Broken Access Control: replay recorded traffic across identities.
+
+    Uses the authenticated sessions declared under `identities:` in scope.yaml.
+    By default only safe (GET/HEAD/OPTIONS) requests are ever sent, so no data is
+    modified; `--allow-mutation` turns that off for full method-tampering testing.
+    """
+    if not requests_file and not forced_browsing:
+        raise ConfigError("nothing to do: pass --requests <file> and/or --forced-browsing <url>.")
+
+    sc = load_scope(config)
+    render_banner(sc, console)
+    sc.require_authorization()
+
+    if not sc.identities:
+        console.print(
+            "[yellow]No identities in scope.yaml[/yellow] — cross-identity and IDOR checks need "
+            "an `identities:` section (name/role/privilege/cookies/headers). Only the "
+            "no-session (anonymous) identity will be used."
+        )
+
+    reqs = load_requests(requests_file) if requests_file else []
+    for req in reqs:
+        sc.require_in_scope(req.url)          # refuse off-scope up front
+    if forced_browsing:
+        sc.require_in_scope(forced_browsing)
+
+    target = forced_browsing or (reqs[0].url if reqs else "")
+    audit = AuditLog(sc.settings.audit_path)
+    audit.log("run.start", target=target, operator=sc.authorization.operator, phase="access")
+    if allow_mutation:
+        console.print(
+            "[red]allow-mutation is ON[/red] — state-changing requests (PUT/DELETE, non-GET "
+            "flows) will be sent. This may modify data on the target."
+        )
+
+    http = HttpClient(sc, rate_limiter=RateLimiter(sc.settings.rate_limit_rps), audit=audit)
+    try:
+        auditor = AccessControlAuditor(http, sc, audit=audit, allow_mutation=allow_mutation)
+        findings = auditor.run(reqs, forced_browsing_base=forced_browsing)
+    finally:
+        http.close()
+
+    findings.sort(key=lambda f: f.sort_key())
+    result = AssessmentResult(
+        target=target,
+        findings=findings,
+        meta={
+            "phase": "access-control",
+            "requests": len(reqs),
+            "identities": [i.name for i in sc.identities],
+            "allow_mutation": allow_mutation,
+            "generated_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ"),
+            "operator": sc.authorization.operator,
+            "tool_version": __version__,
+        },
+    )
+    _print_findings(result)
+    if output:
+        Path(output).write_text(json.dumps(result.to_dict(), indent=2), encoding="utf-8")
+        console.print(f"\nWrote prioritized findings to [bold]{output}[/bold]")
+    console.print(f"Audit log: [bold]{sc.settings.audit_path}[/bold]")
+
+
+@app.command()
+def logic(
+    spec_file: str = typer.Option(..., "--spec", "-s", help="business-logic spec (YAML/JSON)"),
+    config: str = typer.Option("scope.yaml", "--config", "-c", help="path to scope.yaml"),
+    output: str = typer.Option(None, "--output", "-o", help="write prioritized findings JSON here"),
+) -> None:
+    """A06 - Insecure Design: semi-automated business-logic testing.
+
+    Reads a logic spec describing sensitive endpoints, numeric fields, workflows,
+    and race-prone operations, then reports anomalies for MANUAL REVIEW. It proves
+    surprising behaviour but never auto-exploits it.
+    """
+    sc = load_scope(config)
+    render_banner(sc, console)
+    sc.require_authorization()
+
+    spec = load_spec(spec_file)
+    if spec.is_empty:
+        raise ConfigError("logic spec is empty — declare rate_limit / numeric_fields / workflows / race.")
+    for url in spec.all_urls():
+        sc.require_in_scope(url)             # every declared URL must be authorized
+
+    audit = AuditLog(sc.settings.audit_path)
+    audit.log("run.start", target=spec.all_urls()[0], operator=sc.authorization.operator, phase="logic")
+
+    http = HttpClient(sc, rate_limiter=RateLimiter(sc.settings.rate_limit_rps), audit=audit)
+    try:
+        findings = LogicScanner(http, audit=audit).run(spec)
+    finally:
+        http.close()
+
+    findings.sort(key=lambda f: f.sort_key())
+    result = AssessmentResult(
+        target=spec.all_urls()[0],
+        findings=findings,
+        meta={
+            "phase": "insecure-design",
+            "checks": {
+                "rate_limit": len(spec.rate_limit), "numeric": len(spec.numeric),
+                "workflows": len(spec.workflows), "race": len(spec.race),
+            },
+            "generated_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ"),
+            "operator": sc.authorization.operator,
+            "tool_version": __version__,
+        },
+    )
+    _print_findings(result)
+    console.print(
+        "\n[dim]Business-logic findings are candidate anomalies — verify each against the "
+        "application's intended rules before reporting.[/dim]"
+    )
+    if output:
+        Path(output).write_text(json.dumps(result.to_dict(), indent=2), encoding="utf-8")
+        console.print(f"\nWrote prioritized findings to [bold]{output}[/bold]")
+    console.print(f"Audit log: [bold]{sc.settings.audit_path}[/bold]")
+
+
+@app.command()
+def inject(
+    target: str = typer.Argument(..., help="target URL (must be in scope; include ?params to test)"),
+    config: str = typer.Option("scope.yaml", "--config", "-c", help="path to scope.yaml"),
+    output: str = typer.Option(None, "--output", "-o", help="write prioritized findings JSON here"),
+    sleep: int = typer.Option(5, "--sleep", help="delay (s) for time-based SQLi/command payloads"),
+    forms: bool = typer.Option(
+        False, "--forms", help="also inject POST form fields (may modify data — off by default)"
+    ),
+    sqlmap: bool = typer.Option(False, "--sqlmap", help="confirm SQLi with sqlmap --banner (version only)"),
+    browser: bool = typer.Option(
+        False, "--browser", help="confirm XSS DOM execution with Playwright (alert(document.domain))"
+    ),
+) -> None:
+    """A05 - Injection: test parameters for SQLi, command injection, SSTI, and XSS.
+
+    Active testing through the scope-gated client. PoC is non-destructive: it proves
+    execution (timing, arithmetic evaluation, canary reflection, DB errors) and at
+    most reads a version banner — it never dumps tables or modifies data. POST-form
+    injection is opt-in (--forms) because it may write.
+    """
+    sc = load_scope(config)
+    render_banner(sc, console)
+    sc.require_authorization()
+    sc.require_in_scope(target)
+
+    audit = AuditLog(sc.settings.audit_path)
+    audit.log("run.start", target=target, operator=sc.authorization.operator, phase="inject")
+    if forms:
+        console.print("[yellow]--forms is ON[/yellow] — POST form fields will be submitted (may modify data).")
+
+    sqlmap_confirmer = None
+    if sqlmap:
+        sqlmap_confirmer = SqlmapConfirmer()
+        if not sqlmap_confirmer.available:
+            console.print("[yellow]sqlmap not found on PATH[/yellow] — proceeding without it.")
+            sqlmap_confirmer = None
+    xss_confirmer = PlaywrightConfirmer() if browser else None
+
+    http = HttpClient(sc, rate_limiter=RateLimiter(sc.settings.rate_limit_rps), audit=audit)
+    try:
+        scanner = InjectionScanner(
+            http, sleep_seconds=sleep, include_post_forms=forms,
+            sqlmap=sqlmap_confirmer, xss_confirmer=xss_confirmer, audit=audit,
+        )
+        findings = scanner.run(target)
+    finally:
+        http.close()
+
+    findings.sort(key=lambda f: f.sort_key())
+    result = AssessmentResult(
+        target=target,
+        findings=findings,
+        meta={
+            "phase": "injection",
+            "sleep_seconds": sleep,
+            "post_forms": forms,
+            "sqlmap": sqlmap_confirmer is not None,
+            "browser_confirm": browser,
+            "generated_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ"),
+            "operator": sc.authorization.operator,
+            "tool_version": __version__,
+        },
+    )
+    _print_findings(result)
+    if output:
+        Path(output).write_text(json.dumps(result.to_dict(), indent=2), encoding="utf-8")
+        console.print(f"\nWrote prioritized findings to [bold]{output}[/bold]")
+    console.print(f"Audit log: [bold]{sc.settings.audit_path}[/bold]")
+
+
+@app.command()
+def components(
+    target: str = typer.Argument(..., help="target URL (must be in scope)"),
+    config: str = typer.Option("scope.yaml", "--config", "-c", help="path to scope.yaml"),
+    output: str = typer.Option(None, "--output", "-o", help="write prioritized findings JSON here"),
+    no_osv: bool = typer.Option(
+        False, "--no-osv", help="fingerprint components only; skip the OSV.dev CVE lookup"
+    ),
+) -> None:
+    """A03 - Software Supply Chain: fingerprint components, check OSV.dev for CVEs.
+
+    Detection only. The target is read through the scope-gated client; OSV.dev is
+    queried separately (it is a third-party service, not the target under test).
+    """
+    sc = load_scope(config)
+    render_banner(sc, console)
+    sc.require_authorization()
+    sc.require_in_scope(target)
+
+    audit = AuditLog(sc.settings.audit_path)
+    audit.log("run.start", target=target, operator=sc.authorization.operator, phase="components")
+
+    http = HttpClient(sc, rate_limiter=RateLimiter(sc.settings.rate_limit_rps), audit=audit)
+    osv = None if no_osv else OsvClient(timeout=sc.settings.timeout_seconds, audit=audit)
+    try:
+        check = SupplyChainCheck(osv)
+        reports = check.scan(CheckContext(http=http, target=target))
+    finally:
+        http.close()
+        if osv is not None:
+            osv.close()
+
+    _print_inventory(target, reports, checked=not no_osv)
+    findings = build_findings(reports)
+    findings.sort(key=lambda f: f.sort_key())
+
+    result = AssessmentResult(
+        target=target,
+        findings=findings,
+        meta={
+            "phase": "supply-chain",
+            "components_found": len(reports),
+            "osv_checked": not no_osv,
+            "inventory": [
+                {
+                    "name": r.component.name,
+                    "version": r.component.version,
+                    "ecosystem": r.component.ecosystem,
+                    "source": r.component.source,
+                    "vulns": r.all_refs(),
+                }
+                for r in reports
+            ],
+            "generated_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ"),
+            "operator": sc.authorization.operator,
+            "tool_version": __version__,
+        },
+    )
+    _print_findings(result)
+    if any(r.error for r in reports):
+        console.print("[yellow]Some OSV lookups failed[/yellow] (network?) — see the audit log.")
+    if output:
+        Path(output).write_text(json.dumps(result.to_dict(), indent=2), encoding="utf-8")
+        console.print(f"\nWrote prioritized findings to [bold]{output}[/bold]")
+    console.print(f"Audit log: [bold]{sc.settings.audit_path}[/bold]")
+
+
+def _print_inventory(target: str, reports, *, checked: bool) -> None:
+    if not reports:
+        console.print(f"\n[dim]No third-party components fingerprinted on {target}.[/dim]")
+        return
+    table = Table(title=f"Component inventory for {target}")
+    table.add_column("Component")
+    table.add_column("Version")
+    table.add_column("Ecosystem")
+    table.add_column("Source", overflow="fold")
+    table.add_column("CVEs / advisories", overflow="fold")
+    for r in sorted(reports, key=lambda r: (not r.is_vulnerable, r.component.name)):
+        refs = ", ".join(r.all_refs())
+        if r.is_vulnerable:
+            refs = f"[red]{refs}[/red]"
+        elif not checked or not r.component.queryable:
+            refs = "[dim]not checked[/dim]"
+        else:
+            refs = "[green]none known[/green]"
+        table.add_row(
+            r.component.name, r.component.version or "[dim]?[/dim]",
+            r.component.ecosystem or "[dim]-[/dim]", r.component.source, refs,
+        )
+    console.print(table)
 
 
 @app.command()

@@ -95,6 +95,15 @@ pentark preflight
 # 4. Run the assessment against an in-scope target.
 pentark assess http://localhost:3000/ --output findings.json
 
+# 4b. (Optional) A01 — Broken Access Control. Declare your authenticated
+#     sessions under `identities:` in scope.yaml (see the template `init` writes),
+#     capture a few authorized requests into a flows file, then replay them
+#     across identities. Safe by default: only GET/HEAD/OPTIONS are ever sent.
+pentark access --requests flows.yaml --forced-browsing http://localhost:3000/ -o access.json
+#     Full method-tampering (actually sending PUT/DELETE) needs an explicit opt-in
+#     and may modify data:
+pentark access --requests flows.yaml --allow-mutation
+
 # 5. Turn the findings into a professional report (Markdown and/or PDF).
 pentark report findings.json --format both --output report
 #    -> writes report.md and report.pdf
@@ -116,11 +125,92 @@ pentark exploit findings.json --run --unsafe --module exploit/<path>
 
 The assessment prints a prioritized table (severity, CVSS, finding, confidence,
 endpoint), writes the prioritized findings as JSON (which feeds reporting and
-exploitation), and appends to the audit log. The `report` command reads that JSON
+exploitation), and appends to the audit log. Its checks cover missing/weak
+security headers, a safe reflected-XSS probe, and **A02 – Security
+Misconfiguration**: exposed `.git/` / `.env` / backup / key files (confirmed by a
+content signature, not a bare 200), directory listings, verbose error / stack
+traces, technology-version disclosure, and the HTTP TRACE method. Testing a small
+built-in **default-credential** list against a discovered login form is *active*
+(it submits logins), so it is opt-in with `assess --default-creds`. It also covers
+**A04 – Cryptographic Failures**: sensitive data / login forms over cleartext HTTP,
+mixed content on HTTPS pages, **weak TLS** (obsolete protocols/ciphers, expired or
+self-signed certificates — via a standard-library TLS handshake, no external
+tools), API keys / tokens / private keys exposed in responses, JS, or URL query
+strings (reported **masked**, never in the clear), and cookies missing
+`Secure` / `HttpOnly` / `SameSite`. To assess a target behind an untrusted or
+self-signed certificate, set `insecure_tls: true` under `settings:` in
+`scope.yaml` — the weak-TLS check still reports the bad certificate. The `report` command reads that JSON
 back and renders a cover, an executive summary with a severity breakdown, and a
 detailed per-finding section (CVSS score + vector, confidence, CWE, endpoint,
 description, evidence, remediation) plus a methodology/scope + disclaimer
 appendix — as Markdown (`--format md`), PDF (`--format pdf`), or both.
+
+The `access` command tests **A01 – Broken Access Control**. It replays each
+request in a *flows file* under every authenticated identity from `scope.yaml`'s
+`identities:` section (and with no session), flagging responses that return
+privileged data to an identity that should not see it. It also runs **IDOR**
+detection (mutating numeric/UUID identifiers and comparing responses), **forced
+browsing** of admin paths, and **HTTP method tampering** (GET→PUT/DELETE). It is
+non-destructive by default — only `GET`/`HEAD`/`OPTIONS` are ever sent, so IDOR
+proves access purely by *reading* one unauthorized record; active method
+tampering and replay of state-changing flows require the explicit
+`--allow-mutation` opt-in. A flows file is a small YAML/JSON list:
+
+```yaml
+- name: my-account
+  method: GET
+  url: http://localhost:3000/account
+  recorded_as: high        # which identity captured this request
+- { method: GET, url: "http://localhost:3000/invoices/5", recorded_as: low }
+```
+
+The `logic` command tests **A06 – Insecure Design** (semi-automated). Because
+design flaws can't be inferred from a URL, it is driven by a *logic spec*
+(`--spec file.yaml`) in which you declare what to probe; it then reports **candidate
+anomalies for manual review** (low confidence) and never auto-exploits them:
+missing **rate limiting** on sensitive endpoints (burst requests, look for
+throttling), **negative/overflow** values accepted by quantity/price fields,
+**workflow step-skipping** (a later step reachable without the earlier ones), and
+**race conditions** (concurrent requests where more succeed than should). A spec
+looks like:
+
+```yaml
+rate_limit:
+  - { name: login, url: "http://127.0.0.1:3000/login", body: { username: a, password: b }, attempts: 20 }
+numeric_fields:
+  - { name: cart, url: "http://127.0.0.1:3000/cart", field: quantity, extra: { item: "42" } }
+workflows:
+  - name: checkout
+    protected_index: 2
+    success_marker: "Order confirmed"
+    steps: [ { url: ".../step1" }, { url: ".../step2" }, { url: ".../confirm" } ]
+race:
+  - { name: coupon, url: "http://127.0.0.1:3000/redeem", concurrency: 10, expected_success: 1 }
+```
+
+The `inject` command tests **A05 – Injection** (active). For each discovered
+parameter (URL query + GET forms by default; POST forms with `--forms`) it tries
+**SQLi** (error-based, and blind time-based `' AND SLEEP(n)` confirmed against a
+zero-delay control), **OS command injection** (time-delay `; sleep n`), **SSTI**
+(`{{269*271}}` / `${…}`, confirmed when `72899` appears and the expression does
+not), and **XSS** (a unique canary reflected unescaped). Proof-of-concept is
+deliberately **non-destructive**: it proves execution and at most reads a version
+banner — it never dumps tables or modifies rows. Optional external confirmers are
+off by default: `--sqlmap` (runs sqlmap with `--banner` only) and `--browser`
+(Playwright confirms `alert(document.domain)` truly executes in the DOM). Point it
+at `127.0.0.1` / a hostname rather than `localhost` to avoid a per-request IPv6
+fallback delay.
+
+The `components` command tests **A03 – Software Supply Chain Failures**
+(detection only). It fingerprints JS libraries and frameworks from response
+headers, `<script>` tags, inline version banners, `<meta generator>`, and — if
+reachable — `package.json` / `package-lock.json`, then cross-references npm
+components against the **OSV.dev** API and reports each vulnerable component with
+its version, CVE IDs, and CVSS severity. Note the target is read through the
+scope-gated client, but OSV.dev is queried through a **separate** client: it is a
+third-party service we consult, not a target under test, so it is deliberately
+not subject to the scope allowlist. Use `--no-osv` to fingerprint offline
+without the CVE lookup.
 
 The `exploit` command maps confirmed findings to candidate Metasploit modules and
 **offers** them; by default it contacts nothing. `--check` runs Metasploit's
@@ -146,7 +236,14 @@ src/pentark/
 │   ├── cvss.py        # CVSS v3.1 base score + rating (pure, unit-tested)
 │   ├── models.py      # Finding / AssessmentResult (severity from CVSS)
 │   ├── http_client.py # scope + throttle + audit enforced on EVERY request
-│   ├── checks/        # one module per vuln class (headers, reflected XSS, ...)
+│   ├── checks/        # one module per vuln class (headers, reflected XSS,
+│   │                  #   A02 misconfig: files/.git/.env, listings, TRACE, ...)
+│   ├── access/        # A01 broken access control (multi-identity replay, IDOR,
+│   │                  #   forced browsing, method tampering)
+│   ├── supplychain/   # A03 component fingerprinting + OSV.dev CVE lookup
+│   ├── crypto/        # A04 transport/TLS hygiene, secrets scan, cookie flags
+│   ├── injection/     # A05 SQLi / XSS / command injection / SSTI (active)
+│   ├── logic/         # A06 business-logic tests (rate limit, numeric, workflow, race)
 │   └── runner.py      # orchestrate → dedupe → prioritize → JSON
 ├── report/
 │   ├── markdown.py    # pure (result, meta) → Markdown report

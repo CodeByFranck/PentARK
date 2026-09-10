@@ -36,6 +36,10 @@ class HttpClient:
             timeout=scope.settings.timeout_seconds,
             headers={"User-Agent": scope.settings.user_agent},
             follow_redirects=True,
+            # Off by default; opt in (settings.insecure_tls) to assess targets
+            # behind an untrusted/self-signed cert. Ignored when a transport is
+            # injected (tests). The weak-TLS check reports the bad cert regardless.
+            verify=not scope.settings.insecure_tls,
         )
 
     def request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:

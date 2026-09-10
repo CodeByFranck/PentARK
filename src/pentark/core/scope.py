@@ -35,6 +35,32 @@ class Settings:
     timeout_seconds: float = 15.0
     user_agent: str = "PentARK/0.1 (authorized security testing)"
     audit_path: str = "pentark-audit.jsonl"
+    # Opt-in: proceed against targets with an untrusted/self-signed TLS cert
+    # (common for staging). Default False keeps verification on; the weak-TLS
+    # check still reports the bad certificate either way.
+    insecure_tls: bool = False
+
+
+@dataclass(frozen=True)
+class SessionIdentity:
+    """A named authenticated session used by access-control testing.
+
+    Credentials live in scope.yaml alongside the authorization gate on purpose:
+    replaying one user's traffic as another is an *active* operation, so the same
+    signed, in-scope attestation must cover it. ``privilege`` is a relative rank
+    (higher = more privileged) used only to label findings ("a low-priv identity
+    retrieved high-priv data"); the anonymous/no-session identity is rank -1.
+    """
+
+    name: str
+    role: str = "user"
+    privilege: int = 0
+    cookies: dict[str, str] = field(default_factory=dict)
+    headers: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def is_anonymous(self) -> bool:
+        return not self.cookies and not self.headers
 
 
 @dataclass(frozen=True)
@@ -45,7 +71,14 @@ class Scope:
     hosts: tuple[str, ...] = ()
     url_prefixes: tuple[str, ...] = ()
     settings: Settings = field(default_factory=Settings)
+    identities: tuple[SessionIdentity, ...] = ()
     source_path: Path | None = None
+
+    def identity(self, name: str) -> SessionIdentity | None:
+        for ident in self.identities:
+            if ident.name == name:
+                return ident
+        return None
 
     @property
     def is_empty(self) -> bool:
@@ -131,6 +164,47 @@ def _as_str_tuple(value, where: str, key: str) -> tuple[str, ...]:
     return tuple(v.strip() for v in value if v.strip())
 
 
+def _as_str_dict(value, where: str, key: str) -> dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in value.items()
+    ):
+        raise ConfigError(f"[{where}] {key}: expected a mapping of string -> string")
+    return {k: v for k, v in value.items()}
+
+
+def _parse_identities(value) -> tuple[SessionIdentity, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ConfigError("[identities] must be a list of mappings")
+    out: list[SessionIdentity] = []
+    seen: set[str] = set()
+    for i, raw in enumerate(value):
+        if not isinstance(raw, dict):
+            raise ConfigError(f"[identities][{i}]: expected a mapping")
+        name = _as_str(raw.get("name"), f"identities[{i}]", "name").strip()
+        if not name:
+            raise ConfigError(f"[identities][{i}]: name must not be empty")
+        if name in seen:
+            raise ConfigError(f"[identities][{i}]: duplicate identity name {name!r}")
+        seen.add(name)
+        priv_raw = raw.get("privilege", 0)
+        if not isinstance(priv_raw, int) or isinstance(priv_raw, bool):
+            raise ConfigError(f"[identities][{i}] privilege: expected an integer")
+        out.append(
+            SessionIdentity(
+                name=name,
+                role=_as_str(raw.get("role"), f"identities[{i}]", "role").strip() or "user",
+                privilege=priv_raw,
+                cookies=_as_str_dict(raw.get("cookies"), f"identities[{i}]", "cookies"),
+                headers=_as_str_dict(raw.get("headers"), f"identities[{i}]", "headers"),
+            )
+        )
+    return tuple(out)
+
+
 def load_scope(path: str | Path) -> Scope:
     """Load and validate ``scope.yaml`` into a :class:`Scope`."""
     p = Path(path)
@@ -175,6 +249,7 @@ def load_scope(path: str | Path) -> Scope:
         or Settings.user_agent,
         audit_path=_as_str(set_raw.get("audit_path"), "settings", "audit_path")
         or Settings.audit_path,
+        insecure_tls=bool(set_raw.get("insecure_tls", False)),
     )
 
     return Scope(
@@ -182,8 +257,9 @@ def load_scope(path: str | Path) -> Scope:
         hosts=_as_str_tuple(scope_raw.get("hosts"), "scope", "hosts"),
         url_prefixes=_as_str_tuple(scope_raw.get("url_prefixes"), "scope", "url_prefixes"),
         settings=settings,
+        identities=_parse_identities(data.get("identities")),
         source_path=p,
     )
 
 
-__all__ = ["Authorization", "Settings", "Scope", "load_scope"]
+__all__ = ["Authorization", "Settings", "Scope", "SessionIdentity", "load_scope"]
